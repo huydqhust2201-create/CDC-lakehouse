@@ -1,0 +1,318 @@
+# =============================================================================
+# Realtime CDC Lakehouse
+#   PostgreSQL --(Debezium)--> Kafka --(Spark Structured Streaming)--> Delta Lake on MinIO
+#   Bronze (raw CDC) -> Silver (MERGE + Great Expectations + quarantine) -> Gold (Airflow batch)
+# =============================================================================
+
+x-lakehouse-env: &lakehouse-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  CDC_TOPIC_PREFIX: ${CDC_TOPIC_PREFIX:-cdc}
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+  DQ_GE_ENABLED: ${DQ_GE_ENABLED:-true}
+  TQDM_DISABLE: "1"   # silence GE progress bars in logs
+  TZ: UTC
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker
+    dockerfile: airflow/Dockerfile
+  image: cdc-lakehouse/airflow:latest
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment:
+    <<: *lakehouse-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-change-me-please}
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    PYTHONPATH: /opt/lakehouse
+    SPARK_MASTER: local[2]
+    SPARK_DRIVER_MEMORY: 768m
+    AIRFLOW__WEBSERVER__WORKERS: "1"
+    AIRFLOW__CORE__PARALLELISM: "2"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./lakehouse:/opt/lakehouse/lakehouse
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- OLTP source
+  postgres:
+    image: postgres:16
+    container_name: cdc-postgres
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=4
+      - -c
+      - max_wal_senders=4
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: ${POSTGRES_USER:-shop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shop}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d shop"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------- Kafka (KRaft, no ZooKeeper)
+  kafka:
+    image: apache/kafka:3.8.1
+    container_name: cdc-kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  # ---------------------------------------------------------------- Debezium (Kafka Connect)
+  connect:
+    image: quay.io/debezium/connect:2.7.3.Final
+    container_name: cdc-connect
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: cdc-connect
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      HEAP_OPTS: -Xms256m -Xmx768m
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  connect-init:
+    image: curlimages/curl:8.10.1
+    container_name: cdc-connect-init
+    restart: "no"
+    volumes:
+      - ./debezium:/debezium:ro
+    command:
+      - sh
+      - -c
+      - |
+        echo "Waiting for Kafka Connect..."
+        until curl -sf http://connect:8083/connectors > /dev/null; do sleep 3; done
+        echo "Registering Debezium connector..."
+        curl -sf -X PUT -H "Content-Type: application/json" \
+          --data @/debezium/pg-shop-connector.json \
+          http://connect:8083/connectors/pg-shop-connector/config
+        echo ""
+        sleep 5
+        curl -s http://connect:8083/connectors/pg-shop-connector/status
+        echo ""
+    depends_on:
+      - connect
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: cdc-kafka-ui
+    profiles: ["ui"]   # optional: docker compose --profile ui up -d
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: cdc
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- Object storage
+  minio:
+    image: pgsty/minio:latest  # community MinIO build; official images were withdrawn
+    container_name: cdc-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: pgsty/mc:latest
+    container_name: cdc-minio-init
+    restart: "no"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do sleep 2; done
+        mc mb --ignore-existing local/$${LAKEHOUSE_BUCKET}
+        echo "Bucket $${LAKEHOUSE_BUCKET} ready"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      LAKEHOUSE_BUCKET: ${LAKEHOUSE_BUCKET:-lakehouse}
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- Spark streaming (Bronze + Silver)
+  spark-streaming:
+    build:
+      context: ./docker
+      dockerfile: spark/Dockerfile
+    image: cdc-lakehouse/spark:latest
+    container_name: cdc-spark-streaming
+    command: ["python", "-m", "lakehouse.jobs.run_streaming"]
+    restart: unless-stopped
+    environment:
+      <<: *lakehouse-env
+      SPARK_MASTER: local[2]
+      SPARK_DRIVER_MEMORY: 1200m
+      STREAM_TRIGGER_SECONDS: ${STREAM_TRIGGER_SECONDS:-30}
+      SPARK_SHUFFLE_PARTITIONS: "2"
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./lakehouse:/opt/lakehouse/lakehouse
+      - ./tests:/opt/lakehouse/tests
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------- Airflow (Gold batch orchestration)
+  airflow-db:
+    image: postgres:16
+    container_name: cdc-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: cdc-airflow-init
+    restart: "no"
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --username "$${AIRFLOW_ADMIN_USER:-admin}" --password "$${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Admin --lastname Lakehouse --role Admin --email admin@example.com || true
+    environment:
+      <<: *lakehouse-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: cdc-airflow-webserver
+    command: webserver
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: cdc-airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------- OLTP workload simulator
+  datagen:
+    build:
+      context: ./datagen
+    image: cdc-lakehouse/datagen:latest
+    container_name: cdc-datagen
+    restart: unless-stopped
+    command: ["python", "generator.py", "--rate", "${DATAGEN_RATE:-2}", "--bad-ratio", "${DATAGEN_BAD_RATIO:-0.05}"]
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: shop
+      PGUSER: ${POSTGRES_USER:-shop}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-shop}
+    volumes:
+      - ./datagen:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      connect-init:
+        condition: service_completed_successfully
+
+volumes:
+  pg-data:
+  kafka-data:
+  minio-data:
+  airflow-db-data:

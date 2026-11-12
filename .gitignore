@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+airflow/logs/*
+!airflow/logs/.gitkeep
+spark-warehouse/
+metastore_db/
+derby.log
+gx/
+.idea/
+.vscode/
